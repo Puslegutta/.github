@@ -1,0 +1,107 @@
+name: Auto-fill project fields
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+jobs:
+  fill-fields:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.PROJECT_PAT }}
+    steps:
+      - name: Fill missing iteration and milestone
+        run: |
+          # Get project data: ID, iteration field, and current iteration
+          PROJECT_DATA=$(gh api graphql -f query='
+            query {
+              organization(login: "Puslegutta") {
+                projectV2(number: 1) {
+                  id
+                  field(name: "Iteration") {
+                    ... on ProjectV2IterationField {
+                      id
+                      configuration {
+                        iterations { id title }
+                      }
+                    }
+                  }
+                  items(first: 100) {
+                    nodes {
+                      id
+                      fieldValueByName(name: "Iteration") {
+                        ... on ProjectV2ItemFieldIterationValue {
+                          iterationId
+                        }
+                      }
+                      content {
+                        ... on Issue {
+                          number
+                          repository {
+                            nameWithOwner
+                          }
+                          milestone {
+                            id
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          ')
+
+          PROJECT_ID=$(echo "$PROJECT_DATA" | jq -r '.data.organization.projectV2.id')
+          FIELD_ID=$(echo "$PROJECT_DATA" | jq -r '.data.organization.projectV2.field.id')
+          ITERATION_ID=$(echo "$PROJECT_DATA" | jq -r '.data.organization.projectV2.field.configuration.iterations[0].id')
+
+          if [ "$ITERATION_ID" = "null" ] || [ -z "$ITERATION_ID" ]; then
+            echo "No active iteration found, skipping"
+            exit 0
+          fi
+
+          # Find items without iteration set
+          ITEMS_WITHOUT_ITERATION=$(echo "$PROJECT_DATA" | jq -r '
+            .data.organization.projectV2.items.nodes[]
+            | select(.fieldValueByName == null or .fieldValueByName == {} or .fieldValueByName.iterationId == null)
+            | .id
+          ')
+
+          for ITEM_ID in $ITEMS_WITHOUT_ITERATION; do
+            echo "Setting iteration on item: $ITEM_ID"
+            gh api graphql -f query="
+              mutation {
+                updateProjectV2ItemFieldValue(input: {
+                  projectId: \"$PROJECT_ID\"
+                  itemId: \"$ITEM_ID\"
+                  fieldId: \"$FIELD_ID\"
+                  value: { iterationId: \"$ITERATION_ID\" }
+                }) {
+                  projectV2Item { id }
+                }
+              }
+            "
+          done
+
+          # Set milestone on issues that don't have one
+          ISSUES_WITHOUT_MILESTONE=$(echo "$PROJECT_DATA" | jq -r '
+            .data.organization.projectV2.items.nodes[]
+            | select(.content != null and .content != {} and .content.repository != null and (.content.milestone == null or .content.milestone == {}))
+            | "\(.content.repository.nameWithOwner)#\(.content.number)"
+          ')
+
+          for ISSUE_REF in $ISSUES_WITHOUT_MILESTONE; do
+            REPO=$(echo "$ISSUE_REF" | cut -d'#' -f1)
+            ISSUE_NUM=$(echo "$ISSUE_REF" | cut -d'#' -f2)
+
+            MILESTONE_TITLE=$(gh api "repos/$REPO/milestones?state=open&sort=due_on&direction=asc" --jq '[.[] | select(.due_on != null)] | .[0].title // empty')
+
+            if [ -n "$MILESTONE_TITLE" ]; then
+              echo "Setting milestone '$MILESTONE_TITLE' on $ISSUE_REF"
+              gh issue edit "$ISSUE_NUM" --repo "$REPO" --milestone "$MILESTONE_TITLE"
+            fi
+          done
+
+          echo "Done"
