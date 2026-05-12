@@ -1,0 +1,68 @@
+name: Auto-triage issue
+
+on:
+  issues:
+    types: [opened]
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Add to project and set fields
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_PAT }}
+        run: |
+          ISSUE_URL="${{ github.event.issue.html_url }}"
+          REPO="${{ github.repository }}"
+          ISSUE_NUMBER="${{ github.event.issue.number }}"
+
+          # 1. Add issue to project
+          ITEM_ID=$(gh project item-add 1 --owner Puslegutta --url "$ISSUE_URL" --format json --jq '.id')
+          echo "Added item: $ITEM_ID"
+
+          # 2. Set current iteration
+          PROJECT_DATA=$(gh api graphql -f query='
+            query {
+              organization(login: "Puslegutta") {
+                projectV2(number: 1) {
+                  id
+                  field(name: "Iteration") {
+                    ... on ProjectV2IterationField {
+                      id
+                      configuration {
+                        iterations { id title }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          ')
+
+          PROJECT_ID=$(echo "$PROJECT_DATA" | jq -r '.data.organization.projectV2.id')
+          FIELD_ID=$(echo "$PROJECT_DATA" | jq -r '.data.organization.projectV2.field.id')
+          ITERATION_ID=$(echo "$PROJECT_DATA" | jq -r '.data.organization.projectV2.field.configuration.iterations[0].id')
+
+          if [ "$ITERATION_ID" != "null" ] && [ -n "$ITERATION_ID" ]; then
+            gh api graphql -f query="
+              mutation {
+                updateProjectV2ItemFieldValue(input: {
+                  projectId: \"$PROJECT_ID\"
+                  itemId: \"$ITEM_ID\"
+                  fieldId: \"$FIELD_ID\"
+                  value: { iterationId: \"$ITERATION_ID\" }
+                }) {
+                  projectV2Item { id }
+                }
+              }
+            "
+            echo "Set iteration"
+          fi
+
+          # 3. Set milestone (earliest open milestone with a due date)
+          MILESTONE_TITLE=$(gh api "repos/$REPO/milestones?state=open&sort=due_on&direction=asc" --jq '[.[] | select(.due_on != null)] | .[0].title // empty')
+
+          if [ -n "$MILESTONE_TITLE" ]; then
+            gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --milestone "$MILESTONE_TITLE"
+            echo "Set milestone: $MILESTONE_TITLE"
+          fi
